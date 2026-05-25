@@ -15,7 +15,7 @@ import os
 import sys
 import time
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
@@ -166,37 +166,56 @@ def _fetch_tushare_snapshot(token: str) -> pd.DataFrame:
 
     LOGGER.info("Fetching A-share snapshot via Tushare daily_basic fallback")
     pro = ts.pro_api(token)
-    today = datetime.now().strftime("%Y%m%d")
-    calendar = pro.trade_cal(exchange="SSE", start_date="20200101", end_date=today, is_open="1")
-    if calendar is None or calendar.empty:
-        raise RuntimeError("Tushare trade calendar is empty")
-    trade_date = str(calendar.sort_values("cal_date").iloc[-1]["cal_date"])
+    today = datetime.now()
+    daily = pd.DataFrame()
+    trade_date = ""
+    errors: List[str] = []
+    for offset in range(0, 15):
+        candidate_date = (today - timedelta(days=offset)).strftime("%Y%m%d")
+        try:
+            candidate_daily = pro.daily(trade_date=candidate_date)
+        except Exception as exc:
+            errors.append(f"{candidate_date}: {exc}")
+            continue
+        if candidate_daily is not None and not candidate_daily.empty:
+            daily = candidate_daily
+            trade_date = candidate_date
+            break
+    if daily.empty:
+        raise RuntimeError("Tushare daily is empty for recent dates: " + " | ".join(errors[-5:]))
     LOGGER.info("Using Tushare trade_date=%s", trade_date)
 
-    daily = pro.daily(trade_date=trade_date)
-    basic = pro.daily_basic(
-        trade_date=trade_date,
-        fields="ts_code,turnover_rate,volume_ratio,pe,pb,total_mv,circ_mv",
-    )
-    stocks = pro.stock_basic(
-        exchange="",
-        list_status="L",
-        fields="ts_code,symbol,name,market",
-    )
-    if daily is None or daily.empty:
-        raise RuntimeError(f"Tushare daily is empty for {trade_date}")
+    try:
+        basic = pro.daily_basic(
+            trade_date=trade_date,
+            fields="ts_code,turnover_rate,volume_ratio,pe,pb,total_mv,circ_mv",
+        )
+    except Exception as exc:
+        LOGGER.warning("Tushare daily_basic unavailable, continuing with daily data only: %s", exc)
+        basic = pd.DataFrame({"ts_code": daily["ts_code"]})
+
+    try:
+        stocks = pro.stock_basic(
+            exchange="",
+            list_status="L",
+            fields="ts_code,symbol,name,market",
+        )
+    except Exception as exc:
+        LOGGER.warning("Tushare stock_basic unavailable, using stock code as name: %s", exc)
+        stocks = pd.DataFrame({"ts_code": daily["ts_code"], "name": daily["ts_code"]})
+
     merged = daily.merge(basic, on="ts_code", how="left").merge(stocks, on="ts_code", how="left")
     result = pd.DataFrame(
         {
             "代码": merged["ts_code"].astype(str).str.extract(r"(\d{6})", expand=False),
-            "名称": merged["name"],
+            "名称": merged.get("name", merged["ts_code"]),
             "最新价": merged["close"],
             "涨跌幅": merged["pct_chg"],
             "成交额": merged["amount"].map(_to_number) * 1000,
-            "换手率": merged["turnover_rate"],
-            "量比": merged["volume_ratio"],
-            "市盈率-动态": merged["pe"],
-            "市净率": merged["pb"],
+            "换手率": merged["turnover_rate"] if "turnover_rate" in merged else float("nan"),
+            "量比": merged["volume_ratio"] if "volume_ratio" in merged else float("nan"),
+            "市盈率-动态": merged["pe"] if "pe" in merged else float("nan"),
+            "市净率": merged["pb"] if "pb" in merged else float("nan"),
         }
     )
     return result.dropna(subset=["代码", "名称", "最新价", "涨跌幅", "成交额"])
