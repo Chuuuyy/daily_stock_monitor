@@ -13,6 +13,7 @@ import logging
 import math
 import os
 import sys
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -115,13 +116,38 @@ def _first_present(columns: Iterable[str], *candidates: str) -> Optional[str]:
 
 
 def fetch_market_snapshot() -> pd.DataFrame:
-    import akshare as ak
+    errors: List[str] = []
 
-    LOGGER.info("Fetching A-share snapshot via akshare.stock_zh_a_spot_em")
-    df = ak.stock_zh_a_spot_em()
-    if df is None or df.empty:
-        raise RuntimeError("A-share snapshot is empty")
-    return df
+    try:
+        import akshare as ak
+
+        for attempt in range(1, 4):
+            try:
+                LOGGER.info("Fetching A-share snapshot via akshare.stock_zh_a_spot_em, attempt %s/3", attempt)
+                df = ak.stock_zh_a_spot_em()
+                if df is not None and not df.empty:
+                    return df
+                errors.append("akshare returned empty snapshot")
+            except Exception as exc:
+                errors.append(f"akshare attempt {attempt}: {exc}")
+                LOGGER.warning("AkShare snapshot attempt %s failed: %s", attempt, exc)
+                time.sleep(attempt * 2)
+    except ImportError as exc:
+        errors.append(f"akshare import failed: {exc}")
+
+    try:
+        import efinance as ef
+
+        LOGGER.info("Fetching A-share snapshot via efinance.stock.get_realtime_quotes fallback")
+        df = ef.stock.get_realtime_quotes()
+        if df is not None and not df.empty:
+            return df
+        errors.append("efinance returned empty snapshot")
+    except Exception as exc:
+        errors.append(f"efinance fallback: {exc}")
+        LOGGER.warning("Efinance snapshot fallback failed: %s", exc)
+
+    raise RuntimeError("Unable to fetch A-share snapshot: " + " | ".join(errors[-5:]))
 
 
 def normalize_snapshot(df: pd.DataFrame) -> pd.DataFrame:
