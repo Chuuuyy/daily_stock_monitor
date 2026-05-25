@@ -50,7 +50,9 @@ jobs:
 
       - name: 生成候选观察池
         env:
+          TZ: Asia/Shanghai
           LOG_LEVEL: INFO
+          WEEKLY_PICKER_TIMEZONE: Asia/Shanghai
           WEEKLY_PICKER_TOP_N: ${{ github.event.inputs.top_n || vars.WEEKLY_PICKER_TOP_N || '10' }}
           WEEKLY_PICKER_NEWS_ENABLED: ${{ github.event.inputs.news_enabled || vars.WEEKLY_PICKER_NEWS_ENABLED || 'true' }}
           WEEKLY_PICKER_SEND: ${{ github.event.inputs.send_notification || vars.WEEKLY_PICKER_SEND || 'true' }}

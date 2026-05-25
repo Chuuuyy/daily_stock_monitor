@@ -19,6 +19,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import requests
@@ -31,6 +32,11 @@ from src.notification import get_notification_service  # noqa: E402
 
 
 LOGGER = logging.getLogger("weekly_stock_picker")
+MARKET_TZ = ZoneInfo(os.getenv("WEEKLY_PICKER_TIMEZONE", "Asia/Shanghai"))
+
+
+def market_now() -> datetime:
+    return datetime.now(MARKET_TZ)
 
 
 @dataclass
@@ -261,7 +267,7 @@ def _fetch_tushare_snapshot(token: str) -> pd.DataFrame:
 
     LOGGER.info("Fetching A-share snapshot via Tushare daily_basic fallback")
     pro = ts.pro_api(token)
-    today = datetime.now()
+    today = market_now()
     daily = pd.DataFrame()
     trade_date = ""
     errors: List[str] = []
@@ -481,7 +487,7 @@ def _fmt(value: Any, suffix: str = "", default: str = "-") -> str:
 
 
 def render_report(candidates: pd.DataFrame, news_by_code: Dict[str, List[Dict[str, str]]]) -> str:
-    now = datetime.now()
+    now = market_now()
     lines = [
         "# AI 每周股票候选观察池",
         "",
@@ -552,7 +558,7 @@ def render_report(candidates: pd.DataFrame, news_by_code: Dict[str, List[Dict[st
 def save_report(content: str) -> Path:
     reports_dir = ROOT / "reports"
     reports_dir.mkdir(parents=True, exist_ok=True)
-    path = reports_dir / f"weekly_stock_picker_{datetime.now().strftime('%Y%m%d')}.md"
+    path = reports_dir / f"weekly_stock_picker_{market_now().strftime('%Y%m%d')}.md"
     path.write_text(content, encoding="utf-8")
     return path
 
