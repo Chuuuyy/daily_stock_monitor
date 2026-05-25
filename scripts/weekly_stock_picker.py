@@ -117,6 +117,17 @@ def _first_present(columns: Iterable[str], *candidates: str) -> Optional[str]:
 
 def fetch_market_snapshot() -> pd.DataFrame:
     errors: List[str] = []
+    tushare_token = os.getenv("TUSHARE_TOKEN", "").strip()
+
+    if tushare_token:
+        try:
+            df = _fetch_tushare_snapshot(tushare_token)
+            if df is not None and not df.empty:
+                return df
+            errors.append("tushare returned empty snapshot")
+        except Exception as exc:
+            errors.append(f"tushare fallback: {exc}")
+            LOGGER.warning("Tushare snapshot fetch failed: %s", exc)
 
     try:
         import akshare as ak
@@ -148,6 +159,47 @@ def fetch_market_snapshot() -> pd.DataFrame:
         LOGGER.warning("Efinance snapshot fallback failed: %s", exc)
 
     raise RuntimeError("Unable to fetch A-share snapshot: " + " | ".join(errors[-5:]))
+
+
+def _fetch_tushare_snapshot(token: str) -> pd.DataFrame:
+    import tushare as ts
+
+    LOGGER.info("Fetching A-share snapshot via Tushare daily_basic fallback")
+    pro = ts.pro_api(token)
+    today = datetime.now().strftime("%Y%m%d")
+    calendar = pro.trade_cal(exchange="SSE", start_date="20200101", end_date=today, is_open="1")
+    if calendar is None or calendar.empty:
+        raise RuntimeError("Tushare trade calendar is empty")
+    trade_date = str(calendar.sort_values("cal_date").iloc[-1]["cal_date"])
+    LOGGER.info("Using Tushare trade_date=%s", trade_date)
+
+    daily = pro.daily(trade_date=trade_date)
+    basic = pro.daily_basic(
+        trade_date=trade_date,
+        fields="ts_code,turnover_rate,volume_ratio,pe,pb,total_mv,circ_mv",
+    )
+    stocks = pro.stock_basic(
+        exchange="",
+        list_status="L",
+        fields="ts_code,symbol,name,market",
+    )
+    if daily is None or daily.empty:
+        raise RuntimeError(f"Tushare daily is empty for {trade_date}")
+    merged = daily.merge(basic, on="ts_code", how="left").merge(stocks, on="ts_code", how="left")
+    result = pd.DataFrame(
+        {
+            "代码": merged["ts_code"].astype(str).str.extract(r"(\d{6})", expand=False),
+            "名称": merged["name"],
+            "最新价": merged["close"],
+            "涨跌幅": merged["pct_chg"],
+            "成交额": merged["amount"].map(_to_number) * 1000,
+            "换手率": merged["turnover_rate"],
+            "量比": merged["volume_ratio"],
+            "市盈率-动态": merged["pe"],
+            "市净率": merged["pb"],
+        }
+    )
+    return result.dropna(subset=["代码", "名称", "最新价", "涨跌幅", "成交额"])
 
 
 def normalize_snapshot(df: pd.DataFrame) -> pd.DataFrame:
