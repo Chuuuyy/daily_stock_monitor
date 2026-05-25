@@ -9,6 +9,7 @@ enrich only the final candidates with recent news.
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import math
 import os
@@ -20,6 +21,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
 import pandas as pd
+import requests
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -130,6 +132,15 @@ def fetch_market_snapshot() -> pd.DataFrame:
             LOGGER.warning("Tushare snapshot fetch failed: %s", exc)
 
     try:
+        df = _fetch_tencent_snapshot()
+        if df is not None and not df.empty:
+            return df
+        errors.append("tencent returned empty snapshot")
+    except Exception as exc:
+        errors.append(f"tencent fallback: {exc}")
+        LOGGER.warning("Tencent snapshot fallback failed: %s", exc)
+
+    try:
         import akshare as ak
 
         for attempt in range(1, 4):
@@ -159,6 +170,90 @@ def fetch_market_snapshot() -> pd.DataFrame:
         LOGGER.warning("Efinance snapshot fallback failed: %s", exc)
 
     raise RuntimeError("Unable to fetch A-share snapshot: " + " | ".join(errors[-5:]))
+
+
+def _to_tencent_symbol(code: str) -> str:
+    return f"sh{code}" if code.startswith("6") else f"sz{code}"
+
+
+def _parse_tencent_amount(fields: List[str]) -> float:
+    if len(fields) > 35 and fields[35]:
+        parts = fields[35].split("/")
+        if len(parts) >= 3:
+            amount = _to_number(parts[2])
+            if pd.notna(amount):
+                return amount
+    if len(fields) > 37:
+        amount_wan = _to_number(fields[37])
+        if pd.notna(amount_wan):
+            return amount_wan * 10000
+    return float("nan")
+
+
+def _fetch_tencent_snapshot() -> pd.DataFrame:
+    index_path = ROOT / "apps" / "dsa-web" / "public" / "stocks.index.json"
+    if not index_path.exists():
+        raise RuntimeError(f"stock index not found: {index_path}")
+
+    entries = json.loads(index_path.read_text(encoding="utf-8"))
+    stocks = [
+        {"code": str(item[1]), "name": str(item[2])}
+        for item in entries
+        if len(item) >= 8 and item[6] == "CN" and item[7] == "stock" and str(item[1]).isdigit()
+    ]
+    if not stocks:
+        raise RuntimeError("stock index has no CN stock entries")
+
+    LOGGER.info("Fetching A-share snapshot via Tencent batch quotes, stocks=%s", len(stocks))
+    rows: List[Dict[str, Any]] = []
+    headers = {
+        "Referer": "https://finance.qq.com/",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
+    }
+    for start in range(0, len(stocks), 120):
+        batch = stocks[start : start + 120]
+        query = ",".join(_to_tencent_symbol(item["code"]) for item in batch)
+        response = requests.get(f"http://qt.gtimg.cn/q={query}", headers=headers, timeout=15)
+        response.encoding = "gbk"
+        if response.status_code != 200:
+            LOGGER.warning("Tencent batch %s failed: HTTP %s", start // 120 + 1, response.status_code)
+            continue
+
+        for line in response.text.splitlines():
+            if '="' not in line:
+                continue
+            data_start = line.find('"')
+            data_end = line.rfind('"')
+            if data_start < 0 or data_end <= data_start:
+                continue
+            fields = line[data_start + 1 : data_end].split("~")
+            if len(fields) < 39 or not fields[2]:
+                continue
+            code = str(fields[2]).strip()
+            price = _to_number(fields[3] if len(fields) > 3 else None)
+            pct = _to_number(fields[32] if len(fields) > 32 else None)
+            amount = _parse_tencent_amount(fields)
+            if not code or pd.isna(price) or pd.isna(pct) or pd.isna(amount):
+                continue
+            rows.append(
+                {
+                    "代码": code,
+                    "名称": fields[1] if len(fields) > 1 and fields[1] else code,
+                    "最新价": price,
+                    "涨跌幅": pct,
+                    "成交额": amount,
+                    "换手率": _to_number(fields[38] if len(fields) > 38 else None),
+                    "量比": _to_number(fields[49] if len(fields) > 49 else None),
+                    "市盈率-动态": _to_number(fields[39] if len(fields) > 39 else None),
+                    "市净率": _to_number(fields[46] if len(fields) > 46 else None),
+                }
+            )
+        time.sleep(0.15)
+
+    if not rows:
+        raise RuntimeError("Tencent quote batches returned no parseable rows")
+    LOGGER.info("Tencent snapshot returned %s rows", len(rows))
+    return pd.DataFrame(rows)
 
 
 def _fetch_tushare_snapshot(token: str) -> pd.DataFrame:
