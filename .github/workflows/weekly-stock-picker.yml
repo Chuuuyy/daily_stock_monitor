@@ -9,7 +9,7 @@ on:
       top_n:
         description: '候选数量'
         required: false
-        default: '10'
+        default: '3'
       news_enabled:
         description: '是否使用 Tavily 补充近期新闻'
         required: false
@@ -48,12 +48,20 @@ jobs:
       - name: 创建必要目录
         run: mkdir -p data logs reports
 
+      - name: 恢复上期候选快照
+        uses: actions/cache@v4
+        with:
+          path: reports/weekly_stock_picker_*.json
+          key: weekly-stock-picker-snapshots-${{ github.run_id }}
+          restore-keys: |
+            weekly-stock-picker-snapshots-
+
       - name: 生成候选观察池
         env:
           TZ: Asia/Shanghai
           LOG_LEVEL: INFO
           WEEKLY_PICKER_TIMEZONE: Asia/Shanghai
-          WEEKLY_PICKER_TOP_N: ${{ github.event.inputs.top_n || vars.WEEKLY_PICKER_TOP_N || '10' }}
+          WEEKLY_PICKER_TOP_N: ${{ github.event.inputs.top_n || vars.WEEKLY_PICKER_TOP_N || '3' }}
           WEEKLY_PICKER_NEWS_ENABLED: ${{ github.event.inputs.news_enabled || vars.WEEKLY_PICKER_NEWS_ENABLED || 'true' }}
           WEEKLY_PICKER_SEND: ${{ github.event.inputs.send_notification || vars.WEEKLY_PICKER_SEND || 'true' }}
           WEEKLY_PICKER_MIN_AMOUNT_YI: ${{ vars.WEEKLY_PICKER_MIN_AMOUNT_YI || '1.5' }}
@@ -61,6 +69,8 @@ jobs:
           WEEKLY_PICKER_MAX_TURNOVER: ${{ vars.WEEKLY_PICKER_MAX_TURNOVER || '20.0' }}
           WEEKLY_PICKER_MIN_PRICE: ${{ vars.WEEKLY_PICKER_MIN_PRICE || '3.0' }}
           WEEKLY_PICKER_MAX_PRICE: ${{ vars.WEEKLY_PICKER_MAX_PRICE || '200.0' }}
+          WEEKLY_PICKER_SECTOR_COUNT: ${{ vars.WEEKLY_PICKER_SECTOR_COUNT || '8' }}
+          WEEKLY_PICKER_MAX_PER_SECTOR: ${{ vars.WEEKLY_PICKER_MAX_PER_SECTOR || '1' }}
           WEEKLY_PICKER_NEWS_DAYS: ${{ vars.WEEKLY_PICKER_NEWS_DAYS || '14' }}
           WEEKLY_PICKER_NEWS_RESULTS: ${{ vars.WEEKLY_PICKER_NEWS_RESULTS || '3' }}
 

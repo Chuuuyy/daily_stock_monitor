@@ -13,6 +13,7 @@ import json
 import logging
 import math
 import os
+import re
 import sys
 import time
 from dataclasses import dataclass
@@ -41,12 +42,14 @@ def market_now() -> datetime:
 
 @dataclass
 class PickerConfig:
-    top_n: int = 10
+    top_n: int = 3
     min_amount_yi: float = 1.5
     min_turnover: float = 1.0
     max_turnover: float = 20.0
     min_price: float = 3.0
     max_price: float = 200.0
+    sector_count: int = 8
+    max_per_sector: int = 1
     news_enabled: bool = True
     news_days: int = 14
     news_results: int = 3
@@ -88,12 +91,14 @@ def _env_float(name: str, default: float, *, minimum: Optional[float] = None) ->
 
 def load_config(args: argparse.Namespace) -> PickerConfig:
     return PickerConfig(
-        top_n=args.top_n or _env_int("WEEKLY_PICKER_TOP_N", 10, minimum=3, maximum=30),
+        top_n=args.top_n or _env_int("WEEKLY_PICKER_TOP_N", 3, minimum=1, maximum=30),
         min_amount_yi=_env_float("WEEKLY_PICKER_MIN_AMOUNT_YI", 1.5, minimum=0.0),
         min_turnover=_env_float("WEEKLY_PICKER_MIN_TURNOVER", 1.0, minimum=0.0),
         max_turnover=_env_float("WEEKLY_PICKER_MAX_TURNOVER", 20.0, minimum=0.0),
         min_price=_env_float("WEEKLY_PICKER_MIN_PRICE", 3.0, minimum=0.0),
         max_price=_env_float("WEEKLY_PICKER_MAX_PRICE", 200.0, minimum=0.0),
+        sector_count=_env_int("WEEKLY_PICKER_SECTOR_COUNT", 8, minimum=3, maximum=20),
+        max_per_sector=_env_int("WEEKLY_PICKER_MAX_PER_SECTOR", 1, minimum=1, maximum=5),
         news_enabled=args.news if args.news is not None else _env_bool("WEEKLY_PICKER_NEWS_ENABLED", True),
         news_days=_env_int("WEEKLY_PICKER_NEWS_DAYS", 14, minimum=1, maximum=60),
         news_results=_env_int("WEEKLY_PICKER_NEWS_RESULTS", 3, minimum=1, maximum=5),
@@ -355,6 +360,55 @@ def normalize_snapshot(df: pd.DataFrame) -> pd.DataFrame:
     return normalized
 
 
+def fetch_sector_members(config: PickerConfig) -> Dict[str, str]:
+    """Return code -> sector for the strongest recent industry boards."""
+    try:
+        import akshare as ak
+    except ImportError:
+        LOGGER.warning("akshare is not installed; skip sector membership")
+        return {}
+
+    try:
+        sector_df = ak.stock_board_industry_name_em()
+    except Exception as exc:
+        LOGGER.warning("Fetch industry sector ranking failed: %s", exc)
+        return {}
+    if sector_df is None or sector_df.empty:
+        return {}
+
+    name_col = _first_present(sector_df.columns, "板块名称", "板块", "行业名称", "名称")
+    pct_col = _first_present(sector_df.columns, "涨跌幅", "涨幅", "change_pct")
+    if not name_col:
+        return {}
+
+    work = sector_df.copy()
+    if pct_col:
+        work["_pct"] = work[pct_col].map(_to_number)
+        work = work.sort_values("_pct", ascending=False)
+
+    mapping: Dict[str, str] = {}
+    sector_names = [str(name).strip() for name in work[name_col].head(config.sector_count) if str(name).strip()]
+    for sector_name in sector_names:
+        try:
+            cons = ak.stock_board_industry_cons_em(symbol=sector_name)
+        except Exception as exc:
+            LOGGER.debug("Fetch sector constituents failed for %s: %s", sector_name, exc)
+            continue
+        if cons is None or cons.empty:
+            continue
+        code_col = _first_present(cons.columns, "代码", "股票代码", "code")
+        if not code_col:
+            continue
+        for raw_code in cons[code_col]:
+            code_match = re.search(r"\d{6}", str(raw_code))
+            if code_match:
+                mapping.setdefault(code_match.group(0), sector_name)
+        time.sleep(0.2)
+
+    LOGGER.info("Loaded sector membership: sectors=%s stocks=%s", len(sector_names), len(mapping))
+    return mapping
+
+
 def _score_row(row: pd.Series) -> tuple[float, List[str], List[str]]:
     score = 50.0
     reasons: List[str] = []
@@ -418,10 +472,39 @@ def _score_row(row: pd.Series) -> tuple[float, List[str], List[str]]:
             score -= 5
             risks.append("PB 偏高")
 
+    sector = str(row.get("sector") or "").strip()
+    if sector and sector != "未分类":
+        score += 6
+        reasons.append(f"处于强势板块：{sector}")
+
     return round(max(0, min(100, score)), 1), reasons[:4], risks[:4]
 
 
-def build_candidates(df: pd.DataFrame, config: PickerConfig) -> pd.DataFrame:
+def _diversify_by_sector(data: pd.DataFrame, config: PickerConfig) -> pd.DataFrame:
+    selected: List[int] = []
+    sector_counts: Dict[str, int] = {}
+
+    for idx, row in data.iterrows():
+        sector = str(row.get("sector") or "未分类")
+        count = sector_counts.get(sector, 0)
+        if sector != "未分类" and count >= config.max_per_sector:
+            continue
+        selected.append(idx)
+        sector_counts[sector] = count + 1
+        if len(selected) >= config.top_n:
+            break
+
+    if len(selected) < config.top_n:
+        for idx in data.index:
+            if idx not in selected:
+                selected.append(idx)
+            if len(selected) >= config.top_n:
+                break
+
+    return data.loc[selected].reset_index(drop=True)
+
+
+def build_candidates(df: pd.DataFrame, config: PickerConfig, sector_members: Dict[str, str]) -> pd.DataFrame:
     data = df.copy()
     data = data[data["code"].str.match(r"^[036]\d{5}$", na=False)]
     data = data[~data["name"].str.contains("ST|退|退市", case=False, na=False)]
@@ -429,12 +512,19 @@ def build_candidates(df: pd.DataFrame, config: PickerConfig) -> pd.DataFrame:
     data = data[data["amount_yi"] >= config.min_amount_yi]
     data = data[(data["turnover"].isna()) | ((data["turnover"] >= config.min_turnover) & (data["turnover"] <= config.max_turnover))]
     data = data[(data["pct"] >= -4.5) & (data["pct"] <= 7.5)]
+    data["sector"] = data["code"].map(sector_members).fillna("未分类")
+
+    if sector_members:
+        sector_data = data[data["sector"] != "未分类"].copy()
+        if not sector_data.empty:
+            data = sector_data
 
     scored = data.apply(_score_row, axis=1, result_type="expand")
     data["score"] = scored[0]
     data["reasons"] = scored[1]
     data["risks"] = scored[2]
-    return data.sort_values(["score", "amount_yi"], ascending=[False, False]).head(config.top_n).reset_index(drop=True)
+    ranked = data.sort_values(["score", "amount_yi"], ascending=[False, False])
+    return _diversify_by_sector(ranked, config)
 
 
 def search_recent_news(candidates: pd.DataFrame, config: PickerConfig) -> Dict[str, List[Dict[str, str]]]:
@@ -497,18 +587,20 @@ def render_report(candidates: pd.DataFrame, news_by_code: Dict[str, List[Dict[st
         "",
         "## 候选列表",
         "",
-        "| 排名 | 代码 | 名称 | 评分 | 涨跌幅 | 成交额(亿) | 换手率 | PE | PB | 主要理由 | 风险点 |",
-        "|---:|---|---|---:|---:|---:|---:|---:|---:|---|---|",
+        "| 排名 | 板块 | 代码 | 名称 | 评分 | 最新价 | 涨跌幅 | 成交额(亿) | 换手率 | PE | PB | 主要理由 | 风险点 |",
+        "|---:|---|---|---|---:|---:|---:|---:|---:|---:|---:|---|---|",
     ]
     for idx, row in candidates.iterrows():
         reasons = "；".join(row["reasons"]) if row["reasons"] else "-"
         risks = "；".join(row["risks"]) if row["risks"] else "暂无明显规则风险"
         lines.append(
-            "| {rank} | {code} | {name} | {score} | {pct} | {amount} | {turnover} | {pe} | {pb} | {reasons} | {risks} |".format(
+            "| {rank} | {sector} | {code} | {name} | {score} | {price} | {pct} | {amount} | {turnover} | {pe} | {pb} | {reasons} | {risks} |".format(
                 rank=idx + 1,
+                sector=row.get("sector") or "未分类",
                 code=row["code"],
                 name=row["name"],
                 score=_fmt(row["score"]),
+                price=_fmt(row["price"]),
                 pct=_fmt(row["pct"], "%"),
                 amount=_fmt(row["amount_yi"]),
                 turnover=_fmt(row["turnover"], "%"),
@@ -525,6 +617,7 @@ def render_report(candidates: pd.DataFrame, news_by_code: Dict[str, List[Dict[st
             [
                 f"### {idx + 1}. {row['name']}（{row['code']}）",
                 "",
+                f"- 所属主线：{row.get('sector') or '未分类'}",
                 f"- 规则评分：{_fmt(row['score'])}",
                 f"- 量价状态：涨跌幅 {_fmt(row['pct'], '%')}，成交额 {_fmt(row['amount_yi'])} 亿，换手率 {_fmt(row['turnover'], '%')}，量比 {_fmt(row['volume_ratio'])}",
                 f"- 估值观察：PE {_fmt(row['pe'])}，PB {_fmt(row['pb'])}",
@@ -549,17 +642,110 @@ def render_report(candidates: pd.DataFrame, news_by_code: Dict[str, List[Dict[st
             "",
             "- 更偏保守：提高 `WEEKLY_PICKER_MIN_AMOUNT_YI`，降低 `WEEKLY_PICKER_MAX_TURNOVER`。",
             "- 更少消耗：把 `WEEKLY_PICKER_NEWS_ENABLED` 设为 `false`，只保留行情规则筛选。",
-            "- 更集中：把 `WEEKLY_PICKER_TOP_N` 设为 5，只推送最靠前的候选。",
+            "- 更集中：默认只推送 3 只；如需扩大观察池，再调高 `WEEKLY_PICKER_TOP_N`。",
         ]
     )
     return "\n".join(lines).strip() + "\n"
 
 
-def save_report(content: str) -> Path:
+def _snapshot_payload(candidates: pd.DataFrame) -> Dict[str, Any]:
+    generated_at = market_now().isoformat()
+    rows: List[Dict[str, Any]] = []
+    for idx, row in candidates.iterrows():
+        rows.append(
+            {
+                "rank": int(idx + 1),
+                "code": str(row["code"]),
+                "name": str(row["name"]),
+                "sector": str(row.get("sector") or "未分类"),
+                "price": float(row["price"]),
+                "pct": float(row["pct"]),
+                "score": float(row["score"]),
+            }
+        )
+    return {"generated_at": generated_at, "candidates": rows}
+
+
+def _latest_previous_snapshot() -> Optional[Dict[str, Any]]:
+    reports_dir = ROOT / "reports"
+    if not reports_dir.exists():
+        return None
+    today = market_now().strftime("%Y%m%d")
+    paths = sorted(
+        p for p in reports_dir.glob("weekly_stock_picker_*.json")
+        if today not in p.stem
+    )
+    if not paths:
+        return None
+    try:
+        return json.loads(paths[-1].read_text(encoding="utf-8"))
+    except Exception as exc:
+        LOGGER.warning("Failed to load previous weekly snapshot %s: %s", paths[-1], exc)
+        return None
+
+
+def build_review_section(previous: Optional[Dict[str, Any]], snapshot: pd.DataFrame) -> str:
+    if not previous or not previous.get("candidates"):
+        return "## 上期候选复盘\n\n- 暂无上期结构化快照，本期开始记录，下周会自动复盘。\n"
+
+    current = snapshot.set_index("code")
+    lines = [
+        "## 上期候选复盘",
+        "",
+        f"上期生成时间：{previous.get('generated_at', '-')}",
+        "",
+        "| 上期排名 | 板块 | 代码 | 名称 | 上期价格 | 当前价格 | 区间变化 | 今日涨跌 | 复盘结论 |",
+        "|---:|---|---|---|---:|---:|---:|---:|---|",
+    ]
+    hits = 0
+    total = 0
+    for item in previous.get("candidates", []):
+        code = str(item.get("code") or "")
+        if code not in current.index:
+            continue
+        total += 1
+        row = current.loc[code]
+        old_price = _to_number(item.get("price"))
+        new_price = _to_number(row.get("price"))
+        change = float("nan")
+        if pd.notna(old_price) and old_price > 0 and pd.notna(new_price):
+            change = (new_price / old_price - 1) * 100
+        today_pct = _to_number(row.get("pct"))
+        ok = pd.notna(change) and change >= 0
+        if ok:
+            hits += 1
+        conclusion = "符合/偏强" if ok else "未兑现/需降权"
+        lines.append(
+            "| {rank} | {sector} | {code} | {name} | {old} | {new} | {change} | {today} | {conclusion} |".format(
+                rank=item.get("rank", "-"),
+                sector=item.get("sector") or "未分类",
+                code=code,
+                name=item.get("name") or row.get("name") or "-",
+                old=_fmt(old_price),
+                new=_fmt(new_price),
+                change=_fmt(change, "%"),
+                today=_fmt(today_pct, "%"),
+                conclusion=conclusion,
+            )
+        )
+
+    if total:
+        lines.extend(["", f"- 简评：上期 {total} 只候选中，价格正向兑现 {hits} 只。"])
+    else:
+        lines.extend(["", "- 简评：上期候选未能在当前行情快照中匹配到，暂不评价。"])
+    return "\n".join(lines) + "\n"
+
+
+def save_report(content: str, candidates: pd.DataFrame) -> Path:
     reports_dir = ROOT / "reports"
     reports_dir.mkdir(parents=True, exist_ok=True)
-    path = reports_dir / f"weekly_stock_picker_{market_now().strftime('%Y%m%d')}.md"
+    stamp = market_now().strftime("%Y%m%d")
+    path = reports_dir / f"weekly_stock_picker_{stamp}.md"
     path.write_text(content, encoding="utf-8")
+    (reports_dir / f"weekly_stock_picker_{stamp}.json").write_text(
+        json.dumps(_snapshot_payload(candidates), ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
     return path
 
 
@@ -580,13 +766,15 @@ def main(argv: Optional[List[str]] = None) -> int:
     LOGGER.info("Weekly picker config: %s", config)
 
     snapshot = normalize_snapshot(fetch_market_snapshot())
-    candidates = build_candidates(snapshot, config)
+    previous = _latest_previous_snapshot()
+    sector_members = fetch_sector_members(config)
+    candidates = build_candidates(snapshot, config, sector_members)
     if candidates.empty:
         raise RuntimeError("No candidates passed the weekly picker filters")
 
     news_by_code = search_recent_news(candidates, config)
-    report = render_report(candidates, news_by_code)
-    report_path = save_report(report)
+    report = build_review_section(previous, snapshot) + "\n" + render_report(candidates, news_by_code)
+    report_path = save_report(report, candidates)
     LOGGER.info("Weekly stock picker report saved: %s", report_path)
 
     if config.send_notification:
