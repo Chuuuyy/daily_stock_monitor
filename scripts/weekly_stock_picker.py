@@ -50,6 +50,7 @@ class PickerConfig:
     max_price: float = 200.0
     sector_count: int = 8
     max_per_sector: int = 1
+    prefer_hot_sectors: bool = True
     news_enabled: bool = True
     news_days: int = 14
     news_results: int = 3
@@ -99,6 +100,7 @@ def load_config(args: argparse.Namespace) -> PickerConfig:
         max_price=_env_float("WEEKLY_PICKER_MAX_PRICE", 200.0, minimum=0.0),
         sector_count=_env_int("WEEKLY_PICKER_SECTOR_COUNT", 8, minimum=3, maximum=20),
         max_per_sector=_env_int("WEEKLY_PICKER_MAX_PER_SECTOR", 1, minimum=1, maximum=5),
+        prefer_hot_sectors=_env_bool("WEEKLY_PICKER_PREFER_HOT_SECTORS", True),
         news_enabled=args.news if args.news is not None else _env_bool("WEEKLY_PICKER_NEWS_ENABLED", True),
         news_days=_env_int("WEEKLY_PICKER_NEWS_DAYS", 14, minimum=1, maximum=60),
         news_results=_env_int("WEEKLY_PICKER_NEWS_RESULTS", 3, minimum=1, maximum=5),
@@ -360,26 +362,26 @@ def normalize_snapshot(df: pd.DataFrame) -> pd.DataFrame:
     return normalized
 
 
-def fetch_sector_members(config: PickerConfig) -> Dict[str, str]:
+def fetch_sector_members(config: PickerConfig) -> tuple[Dict[str, str], bool]:
     """Return code -> sector for the strongest recent industry boards."""
     try:
         import akshare as ak
     except ImportError:
         LOGGER.warning("akshare is not installed; skip sector membership")
-        return {}
+        return _fetch_industry_map_fallback(), False
 
     try:
         sector_df = ak.stock_board_industry_name_em()
     except Exception as exc:
         LOGGER.warning("Fetch industry sector ranking failed: %s", exc)
-        return {}
+        return _fetch_industry_map_fallback(), False
     if sector_df is None or sector_df.empty:
-        return {}
+        return _fetch_industry_map_fallback(), False
 
     name_col = _first_present(sector_df.columns, "板块名称", "板块", "行业名称", "名称")
     pct_col = _first_present(sector_df.columns, "涨跌幅", "涨幅", "change_pct")
     if not name_col:
-        return {}
+        return _fetch_industry_map_fallback(), False
 
     work = sector_df.copy()
     if pct_col:
@@ -406,7 +408,62 @@ def fetch_sector_members(config: PickerConfig) -> Dict[str, str]:
         time.sleep(0.2)
 
     LOGGER.info("Loaded sector membership: sectors=%s stocks=%s", len(sector_names), len(mapping))
+    if mapping:
+        return mapping, True
+    return _fetch_industry_map_fallback(), False
+
+
+def _fetch_industry_map_fallback() -> Dict[str, str]:
+    """Fallback full-market industry map when hot sector constituent APIs fail."""
+    mapping = _fetch_tushare_industry_map()
+    if mapping:
+        return mapping
+    return _fetch_akshare_stock_info_industry_map()
+
+
+def _fetch_tushare_industry_map() -> Dict[str, str]:
+    token = os.getenv("TUSHARE_TOKEN", "").strip()
+    if not token:
+        return {}
+    try:
+        import tushare as ts
+
+        pro = ts.pro_api(token)
+        df = pro.stock_basic(
+            exchange="",
+            list_status="L",
+            fields="ts_code,symbol,name,industry",
+        )
+    except Exception as exc:
+        LOGGER.warning("Tushare stock_basic industry fallback failed: %s", exc)
+        return {}
+    if df is None or df.empty or "industry" not in df.columns:
+        return {}
+
+    mapping: Dict[str, str] = {}
+    for _, row in df.iterrows():
+        code = str(row.get("symbol") or "")
+        industry = str(row.get("industry") or "").strip()
+        if re.fullmatch(r"\d{6}", code) and industry and industry.lower() != "nan":
+            mapping[code] = industry
+    LOGGER.info("Loaded Tushare industry map: stocks=%s", len(mapping))
     return mapping
+
+
+def _fetch_akshare_stock_info_industry_map() -> Dict[str, str]:
+    try:
+        import akshare as ak
+
+        df = ak.stock_individual_info_em(symbol="000001")
+    except Exception as exc:
+        LOGGER.debug("AkShare individual info probe failed: %s", exc)
+        return {}
+    if df is None or df.empty:
+        return {}
+
+    # This endpoint is per-stock and too expensive for the whole market. Keep the
+    # function as a probe for future extension instead of doing thousands of calls.
+    return {}
 
 
 def _score_row(row: pd.Series) -> tuple[float, List[str], List[str]]:
@@ -504,7 +561,13 @@ def _diversify_by_sector(data: pd.DataFrame, config: PickerConfig) -> pd.DataFra
     return data.loc[selected].reset_index(drop=True)
 
 
-def build_candidates(df: pd.DataFrame, config: PickerConfig, sector_members: Dict[str, str]) -> pd.DataFrame:
+def build_candidates(
+    df: pd.DataFrame,
+    config: PickerConfig,
+    sector_members: Dict[str, str],
+    *,
+    hot_sector_map: bool,
+) -> pd.DataFrame:
     data = df.copy()
     data = data[data["code"].str.match(r"^[036]\d{5}$", na=False)]
     data = data[~data["name"].str.contains("ST|退|退市", case=False, na=False)]
@@ -514,7 +577,7 @@ def build_candidates(df: pd.DataFrame, config: PickerConfig, sector_members: Dic
     data = data[(data["pct"] >= -4.5) & (data["pct"] <= 7.5)]
     data["sector"] = data["code"].map(sector_members).fillna("未分类")
 
-    if sector_members:
+    if hot_sector_map and config.prefer_hot_sectors:
         sector_data = data[data["sector"] != "未分类"].copy()
         if not sector_data.empty:
             data = sector_data
@@ -767,8 +830,8 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     snapshot = normalize_snapshot(fetch_market_snapshot())
     previous = _latest_previous_snapshot()
-    sector_members = fetch_sector_members(config)
-    candidates = build_candidates(snapshot, config, sector_members)
+    sector_members, hot_sector_map = fetch_sector_members(config)
+    candidates = build_candidates(snapshot, config, sector_members, hot_sector_map=hot_sector_map)
     if candidates.empty:
         raise RuntimeError("No candidates passed the weekly picker filters")
 
