@@ -280,7 +280,9 @@ class CommandDispatcher:
             )
 
         if command.admin_only and not self.is_admin(message.user_id):
-            return cmd_name, args, None, BotResponse.error_response("此命令需要管理员权限")
+            return cmd_name, args, None, BotResponse.error_response(
+                f"此命令需要管理员权限。你的用户ID: {message.user_id}"
+            )
 
         error_msg = command.validate_args(args)
         if error_msg:

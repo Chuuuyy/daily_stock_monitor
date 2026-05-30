@@ -45,6 +45,30 @@ FEISHU_STREAM_ENABLED=true
 - 只想收通知时，不要只填 App ID / Secret，必须优先配置 `FEISHU_WEBHOOK_URL`
 - 如果你做的是应用机器人 / Stream Bot，可直接看文末保留的原流程截图参考
 
+### 在飞书里修改每日自选股
+
+Stream Bot 启用后，可以使用管理员命令修改 GitHub Actions 的 `STOCK_LIST` 变量：
+
+```text
+/自选 兆易创新 立讯精密 福晶科技
+/自选 add 比特币
+/自选 remove 立讯精密
+/自选
+/自选 run
+```
+
+需要额外配置：
+
+```bash
+BOT_ADMIN_USERS=你的飞书用户ID
+WATCHLIST_GITHUB_REPOSITORY=Chuuuyy/daily_stock_monitor
+WATCHLIST_GITHUB_TOKEN=github_pat_xxx
+WATCHLIST_DAILY_WORKFLOW=00-daily-analysis.yml
+WATCHLIST_WORKFLOW_REF=main
+```
+
+`WATCHLIST_GITHUB_TOKEN` 建议使用 Fine-grained PAT，只授权当前仓库，并开启 Actions variables 写权限；如果要使用 `/自选 run`，还需要 Actions workflow dispatch 相关权限。
+
 ## Webhook 推送的正确配置步骤
 
 ### 1. 在飞书群里创建自定义机器人
