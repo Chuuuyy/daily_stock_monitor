@@ -17,6 +17,7 @@ A股自选股智能分析系统 - 通知层
 from __future__ import annotations
 
 import logging
+import os
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -1572,6 +1573,9 @@ class NotificationService(
         models = self._collect_models_used(results)
         if models:
             lines.append(f"*{labels['analysis_model_label']}: {', '.join(models)}*")
+        details_url = self._github_actions_run_url()
+        if details_url:
+            lines.append(f"[查看详细报告]({details_url})")
         return "\n".join(lines)
 
     @staticmethod
@@ -1597,6 +1601,15 @@ class NotificationService(
             if text and text not in {"-", "N/A", "None", "null"}:
                 parts.append(f"{label} {self._truncate_brief_text(text, 24)}")
         return "；".join(parts)
+
+    @staticmethod
+    def _github_actions_run_url() -> str:
+        server_url = os.getenv("GITHUB_SERVER_URL", "https://github.com").strip()
+        repository = os.getenv("GITHUB_REPOSITORY", "").strip()
+        run_id = os.getenv("GITHUB_RUN_ID", "").strip()
+        if not repository or not run_id:
+            return ""
+        return f"{server_url}/{repository}/actions/runs/{run_id}"
 
     def generate_single_stock_report(self, result: AnalysisResult) -> str:
         """
