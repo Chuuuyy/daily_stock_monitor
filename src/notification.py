@@ -1531,7 +1531,7 @@ class NotificationService(
             )
             if out:
                 return out
-        # Fallback: brief summary from dashboard report
+        # Fallback: judgment-first brief summary from dashboard report.
         if not results:
             return f"# {report_date} {labels['brief_title']}\n\n{labels['no_results']}"
         sorted_results = sorted(results, key=lambda x: x.sentiment_score, reverse=True)
@@ -1549,18 +1549,54 @@ class NotificationService(
             name = self._get_display_name(r, report_language)
             dash = r.dashboard or {}
             core = dash.get('core_conclusion', {}) or {}
-            one = (core.get('one_sentence') or r.analysis_summary or '')[:60]
-            lines.append(
-                f"**{name}({r.code})** {emoji} "
-                f"{localize_operation_advice(r.operation_advice, report_language)} | "
-                f"{labels['score_label']} {r.sentiment_score} | {one}"
+            battle = dash.get('battle_plan', {}) or {}
+            sniper = battle.get('sniper_points', {}) or {}
+            advice = localize_operation_advice(r.operation_advice, report_language)
+            trend = localize_trend_prediction(r.trend_prediction, report_language)
+            one = self._truncate_brief_text(
+                core.get('one_sentence') or r.analysis_summary or '',
+                90,
             )
+            lines.extend([
+                f"## {emoji} {name}（{r.code}）",
+                f"- 判断：**{advice}**｜{labels['score_label']} {r.sentiment_score}｜{trend}",
+            ])
+            if one:
+                lines.append(f"- 分析：{one}")
+            levels = self._format_brief_key_levels(sniper, report_language)
+            if levels:
+                lines.append(f"- 价位：{levels}")
+            lines.append("")
         lines.append("")
         lines.append(f"*{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}*")
         models = self._collect_models_used(results)
         if models:
             lines.append(f"*{labels['analysis_model_label']}: {', '.join(models)}*")
         return "\n".join(lines)
+
+    @staticmethod
+    def _truncate_brief_text(text: Any, limit: int) -> str:
+        """Keep push notifications compact while preserving a complete thought."""
+        cleaned = " ".join(str(text or "").split())
+        if len(cleaned) <= limit:
+            return cleaned
+        return cleaned[: max(0, limit - 1)].rstrip("，。；、,. ") + "…"
+
+    def _format_brief_key_levels(self, sniper: Dict[str, Any], report_language: str) -> str:
+        if not sniper:
+            return ""
+        labels = get_report_labels(report_language)
+        fields = [
+            (labels.get('ideal_buy_label', '买入'), sniper.get('ideal_buy')),
+            (labels.get('stop_loss_label', '止损'), sniper.get('stop_loss')),
+            (labels.get('take_profit_label', '止盈'), sniper.get('take_profit')),
+        ]
+        parts = []
+        for label, value in fields:
+            text = str(value or "").strip()
+            if text and text not in {"-", "N/A", "None", "null"}:
+                parts.append(f"{label} {self._truncate_brief_text(text, 24)}")
+        return "；".join(parts)
 
     def generate_single_stock_report(self, result: AnalysisResult) -> str:
         """
