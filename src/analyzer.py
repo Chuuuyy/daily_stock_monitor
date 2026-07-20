@@ -837,6 +837,7 @@ def stabilize_decision_with_structure(
         )
 
         has_significant_risk = _has_structural_risk_alert(result)
+        hard_bearish_breakdown = _has_hard_bearish_breakdown(result, trend_dict)
 
         if decision_type == "buy":
             if near_resistance and flow_bias != "inflow":
@@ -873,7 +874,16 @@ def stabilize_decision_with_structure(
                     flow_bias=flow_bias,
                 )
         elif decision_type == "sell":
-            if near_support and (flow_bias != "outflow") and not has_significant_risk:
+            if hard_bearish_breakdown:
+                _apply_bearish_risk_floor(
+                    result,
+                    language,
+                    current_price=current_price,
+                    support=support,
+                    resistance=resistance,
+                    flow_bias=flow_bias,
+                )
+            elif near_support and (flow_bias != "outflow") and not has_significant_risk:
                 _downgrade_to_structural_hold(
                     result,
                     language,
@@ -897,7 +907,16 @@ def stabilize_decision_with_structure(
                 )
         elif decision_type == "hold":
             change_pct = _first_numeric_value(getattr(result, "change_pct", None))
-            if change_pct is not None and change_pct < 0 and near_support and flow_bias != "outflow":
+            if hard_bearish_breakdown:
+                _apply_bearish_risk_floor(
+                    result,
+                    language,
+                    current_price=current_price,
+                    support=support,
+                    resistance=resistance,
+                    flow_bias=flow_bias,
+                )
+            elif change_pct is not None and change_pct < 0 and near_support and flow_bias != "outflow":
                 _set_structural_hold_wording(
                     result,
                     language,
@@ -922,6 +941,85 @@ def stabilize_decision_with_structure(
         _sync_stability_dashboard_fields(result)
     except Exception as exc:
         logger.warning("[decision_stability] skipped: %s", exc)
+
+
+def _has_hard_bearish_breakdown(result: "AnalysisResult", trend_dict: Dict[str, Any]) -> bool:
+    """Detect drawdown/technical damage that should not be softened to hold."""
+    change_pct = _first_numeric_value(getattr(result, "change_pct", None))
+    if change_pct is not None and change_pct <= -7:
+        return True
+
+    text_parts = [
+        getattr(result, "trend_prediction", ""),
+        getattr(result, "operation_advice", ""),
+        getattr(result, "analysis_summary", ""),
+        getattr(result, "technical_analysis", ""),
+        getattr(result, "ma_analysis", ""),
+        getattr(result, "volume_analysis", ""),
+        trend_dict.get("trend_status"),
+        trend_dict.get("ma_alignment"),
+        trend_dict.get("volume_status"),
+        trend_dict.get("buy_signal"),
+        " ".join(str(item) for item in (trend_dict.get("risk_factors") or [])),
+    ]
+    text = " ".join(str(part or "") for part in text_parts)
+    hard_terms = ("跌停", "放量暴跌", "放量杀跌", "破位", "跌破", "强势空头", "空头排列")
+    if any(term in text for term in hard_terms):
+        score = _first_numeric_value(getattr(result, "sentiment_score", None), trend_dict.get("signal_score"))
+        return score is None or score <= 45
+    return False
+
+
+def _apply_bearish_risk_floor(
+    result: "AnalysisResult",
+    language: str,
+    *,
+    current_price: Optional[float],
+    support: Optional[float],
+    resistance: Optional[float],
+    flow_bias: str,
+) -> None:
+    """Keep broken-down names in risk-control mode until repair signals appear."""
+    if language == "zh":
+        advice = "减仓/观望"
+        reason = "技术破位或急跌风险未解除，先按风险控制处理；空仓等待重新站上短期均线后再评估。"
+        trend = "看空"
+        no_position = "空仓不抄底，等待缩量企稳、站回 MA5/MA10 或放量收复关键位。"
+        has_position = "持仓优先控制回撤，可分批降仓；未出现修复信号前不加仓。"
+    else:
+        advice = "Reduce / watch"
+        reason = "Breakdown or sharp drawdown risk is unresolved; treat this as risk control until repair signals appear."
+        trend = "Bearish"
+        no_position = "Do not bottom-fish; wait for stabilization and reclaiming short-term moving averages."
+        has_position = "Prioritize drawdown control and avoid adding until repair signals appear."
+
+    result.decision_type = "sell"
+    result.operation_advice = advice
+    try:
+        result.sentiment_score = min(39, int(getattr(result, "sentiment_score", 39)))
+    except (TypeError, ValueError):
+        result.sentiment_score = 39
+    if language == "zh" and "强烈看空" in str(getattr(result, "trend_prediction", "")):
+        trend = "强烈看空"
+    result.trend_prediction = trend
+    _apply_hold_watch_dashboard(
+        result,
+        language,
+        advice=advice,
+        reason=reason,
+        current_price=current_price,
+        support=support,
+        resistance=resistance,
+        flow_bias=flow_bias,
+        no_position=no_position,
+        has_position=has_position,
+    )
+    result.decision_type = "sell"
+    dashboard = result.dashboard if isinstance(result.dashboard, dict) else {}
+    core = dashboard.get("core_conclusion") if isinstance(dashboard, dict) else {}
+    if isinstance(core, dict):
+        core["signal_type"] = "🔴卖出信号" if language == "zh" else "🔴 Sell signal"
+    _sync_stability_dashboard_fields(result)
 
 
 def _has_structural_risk_alert(result: "AnalysisResult") -> bool:
